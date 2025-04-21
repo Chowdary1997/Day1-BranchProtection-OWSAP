@@ -1,0 +1,119 @@
+pipeline {
+    agent {
+        docker {
+            image 'alpine:3.18'
+            args '--entrypoint=""'
+        }
+    }
+    
+    environment {
+        GIT_COMMITTER_NAME = credentials('git-username')
+        GIT_COMMITTER_EMAIL = credentials('git-email')
+        GIT_COMMITTER_SIGNING_KEY = credentials('gpg-signing-key')
+        REPO = 'https://github.com/your-org/secure-repo.git'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    extensions: [
+                        [
+                            $class: 'CloneOption',
+                            depth: 1,
+                            noTags: false,
+                            shallow: true,
+                            timeout: 10
+                        ],
+                        [
+                            $class: 'CleanBeforeCheckout'
+                        ],
+                        [
+                            $class: 'UserIdentity',
+                            name: "${GIT_COMMITTER_NAME}",
+                            email: "${GIT_COMMITTER_EMAIL}"
+                        ]
+                    ],
+                    userRemoteConfigs: [[
+                        credentialsId: 'github-ssh',
+                        url: "${REPO}"
+                    ]]
+                ])
+                
+                // Verify commit signatures
+                sh '''
+                    git verify-commit HEAD
+                    git log --show-signature -1
+                '''
+            }
+        }
+        
+        stage('Verify CODEOWNERS') {
+            steps {
+                script {
+                    def codeowners = readFile('.github/CODEOWNERS')
+                    if (!codeowners.contains('Dockerfile')) {
+                        error('CODEOWNERS file must specify owners for Dockerfile')
+                    }
+                }
+            }
+        }
+        
+        stage('Dependency Check') {
+            agent {
+                docker {
+                    image 'owasp/dependency-check:8.3.1'
+                    args '-v $WORKSPACE:/src -v /tmp/dependency-check-data:/usr/share/dependency-check/data'
+                }
+            }
+            steps {
+                sh '''
+                    dependency-check.sh \
+                    --project "Secure Repo" \
+                    --scan /src \
+                    --format HTML \
+                    --format SARIF \
+                    --format JSON \
+                    --out /src/reports \
+                    --failOnCVSS 7 \
+                    --disableYarnAudit \
+                    --disableNodeAudit
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true
+                }
+                failure {
+                    slackSend color: 'danger', message: "Dependency Check failed in ${env.JOB_NAME} (${env.BUILD_NUMBER})"
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    docker.build("secure-repo:${env.BUILD_ID}")
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                script {
+                    docker.image('secure-repo:${env.BUILD_ID}').inside {
+                        sh 'trivy fs --security-checks vuln,config,secret --exit-code 1 /'
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            slackSend color: 'good', message: "Build succeeded in ${env.JOB_NAME} (${env.BUILD_NUMBER})"
+        }
+    }
+}

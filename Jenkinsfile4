@@ -1,0 +1,44 @@
+stage('Verify CODEOWNERS') {
+    when {
+        expression { env.CHANGE_ID }  // Only run on PRs
+    }
+    steps {
+        script {
+            // Get changed files
+            def changedFiles = sh(
+                script: "git diff --name-only origin/main...HEAD",
+                returnStdout: true
+            ).trim().split('\n')
+            
+            // Parse CODEOWNERS file
+            def codeowners = readFile('.github/CODEOWNERS')
+            
+            // Check each changed file against CODEOWNERS
+            changedFiles.each { file ->
+                def owners = sh(
+                    script: "git check-attr owners -- ${file} | cut -d: -f3",
+                    returnStdout: true
+                ).trim()
+                
+                if (owners) {
+                    // Check if any owner has approved
+                    def approvers = sh(
+                        script: """
+                            curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                            https://api.github.com/repos/${GITHUB_REPO}/pulls/${CHANGE_ID}/reviews | \
+                            jq -r '.[] | select(.state == \"APPROVED\") | .user.login'
+                        """,
+                        returnStdout: true
+                    ).trim().split('\n')
+                    
+                    def requiredOwners = owners.replaceAll('@', '').split(' ')
+                    def hasApproval = requiredOwners.any { owner -> approvers.contains(owner) }
+                    
+                    if (!hasApproval) {
+                        error("Changes to ${file} require approval from: ${owners}")
+                    }
+                }
+            }
+        }
+    }
+}

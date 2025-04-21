@@ -1,0 +1,139 @@
+pipeline {
+    agent any
+    
+    environment {
+        OWASP_DC_VERSION = "8.3.1"
+        REPORT_DIR = "${WORKSPACE}/reports"
+        GITHUB_REPO = "your-org/secure-repo"
+    }
+    
+    triggers {
+        // Trigger on push to main (via GitHub webhook)
+        githubPush()
+        
+        // Weekly scan (Sunday at midnight)
+        cron('0 0 * * 0')
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                
+                // Verify signed commits if required
+                sh '''
+                    git verify-commit HEAD || exit 1
+                    git log --show-signature -1
+                '''
+            }
+        }
+        
+        stage('Dependency Check') {
+            steps {
+                script {
+                    // Create reports directory
+                    sh "mkdir -p ${REPORT_DIR}"
+                    
+                    // Run OWASP Dependency Check
+                    docker.image("owasp/dependency-check:${OWASP_DC_VERSION}").inside(
+                        "-v ${WORKSPACE}:/src -v ${WORKSPACE}/dependency-check-data:/usr/share/dependency-check/data"
+                    ) {
+                        sh """
+                            dependency-check.sh \
+                            --project "${env.JOB_NAME}" \
+                            --scan /src \
+                            --format HTML \
+                            --format SARIF \
+                            --format JSON \
+                            --out ${REPORT_DIR} \
+                            --failOnCVSS 7 \
+                            --disableYarnAudit \
+                            --disableNodeAudit \
+                            --enableExperimental
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'reports/*', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Analyze Results') {
+            steps {
+                script {
+                    // Parse results and fail if critical vulnerabilities found
+                    def report = readJSON file: "${REPORT_DIR}/dependency-check-report.json"
+                    def criticalVulns = report.dependencies.count { dep -> 
+                        dep.vulnerabilities?.any { vul -> vul.cvssv3?.baseScore >= 7.0 }
+                    }
+                    
+                    if (criticalVulns > 0) {
+                        unstable("Found ${criticalVulns} dependencies with critical vulnerabilities")
+                        
+                        // Comment on GitHub PR if this is a PR build
+                        if (env.CHANGE_ID) {
+                            withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                                sh """
+                                    curl -s -X POST \
+                                    -H "Authorization: token ${GITHUB_TOKEN}" \
+                                    -H "Accept: application/vnd.github.v3+json" \
+                                    https://api.github.com/repos/${GITHUB_REPO}/issues/${CHANGE_ID}/comments \
+                                    -d '{"body":"⚠️ Found ${criticalVulns} critical vulnerabilities in dependencies. Please check the Jenkins report."}'
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Dependabot Simulation') {
+            steps {
+                script {
+                    // Check for outdated dependencies (similar to Dependabot)
+                    def outdatedDeps = sh(
+                        script: "docker run --rm -v ${WORKSPACE}:/app renovate/renovate:latest sh -c 'cd /app && renovate --dry-run --platform=local' | grep 'packageFiles with updates'",
+                        returnStatus: true
+                    )
+                    
+                    if (outdatedDeps == 0) {
+                        echo "Outdated dependencies found - consider updating"
+                        // Could automatically create GitHub issue here
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Upload SARIF report to GitHub Code Scanning
+            script {
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                    sh """
+                        curl -s -X POST \
+                        -H "Authorization: token ${GITHUB_TOKEN}" \
+                        -H "Accept: application/vnd.github.v3+json" \
+                        https://api.github.com/repos/${GITHUB_REPO}/code-scanning/sarifs \
+                        -d '{"commit_sha":"${env.GIT_COMMIT}","ref":"${env.GIT_BRANCH}","sarif":"$(base64 -w0 ${REPORT_DIR}/dependency-check-report.sarif)"}'
+                    """
+                }
+            }
+        }
+        
+        success {
+            slackSend(color: 'good', message: "Dependency scan succeeded for ${env.JOB_NAME} - ${env.BUILD_URL}")
+        }
+        
+        failure {
+            slackSend(color: 'danger', message: "Dependency scan failed for ${env.JOB_NAME} - ${env.BUILD_URL}")
+        }
+        
+        unstable {
+            slackSend(color: 'warning', message: "Dependency scan found vulnerabilities in ${env.JOB_NAME} - ${env.BUILD_URL}")
+        }
+    }
+}

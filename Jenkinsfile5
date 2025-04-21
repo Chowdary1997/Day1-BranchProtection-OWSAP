@@ -1,0 +1,10 @@
+// Example in your pipeline
+post {
+    unstable {
+        emailext (
+            subject: "Vulnerabilities found in ${env.JOB_NAME}",
+            body: """Check ${env.BUILD_URL} for details""",
+            to: 'security-team@your-org.com'
+        )
+    }
+}
