@@ -1,0 +1,7 @@
+# Global owners
+*       @your-username @team-name
+
+# Specific file ownership
+/src/   @frontend-team
+/.github/ @devops-team
+/Dockerfile @security-team @devops-team
